@@ -12,6 +12,7 @@ from click import unstyle
 import pytest
 import typer
 from typer.testing import CliRunner
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -2113,9 +2114,6 @@ def test_report_result_rejects_non_uuid_experiment_id(tmp_path, monkeypatch) -> 
     assert outcome.exit_code == 2
     assert stub.calls == []
     assert "UUID 형식이 아닙니다" in unstyle(outcome.output)
-
-
-import yaml
 
 
 def _write_offline_experiment_dataset(tmp_path):
