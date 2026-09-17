@@ -256,3 +256,64 @@ def test_run_experiment_downsampling_changes_realized_row_count_signal(tmp_path)
     assert result.status == "success"
     assert result.comparison_conditions.sampling_rate == 0.3
     assert result.comparison_conditions.model_params["scale_pos_weight"] == 1.0
+
+
+def _make_result(*, status="success", **comparison_overrides) -> oe.ExperimentResult:
+    conditions = {
+        "data_path": "data/processed/training_dataset.csv",
+        "row_count": 100,
+        "seed": 42,
+        "test_size": 0.2,
+        "val_size": 0.2,
+        "sampling_rate": 1.0,
+        "model_type": "lightgbm",
+        "model_params": {"n_estimators": 200.0, "learning_rate": 0.05, "num_leaves": 31.0, "scale_pos_weight": 1.0},
+    }
+    conditions.update(comparison_overrides)
+    return oe.ExperimentResult(
+        experiment_name="candidate" if status == "success" else "failed_run",
+        status=status,
+        model="lightgbm",
+        features=["age_group"],
+        metrics={"roc_auc": 0.7, "pr_auc": 0.1, "log_loss": 0.2},
+        comparison_conditions=oe.ComparisonConditions(**conditions) if status == "success" else None,
+    )
+
+
+def test_apply_baseline_comparison_computes_delta_when_conditions_match() -> None:
+    baseline = _make_result()
+    candidate = _make_result()
+    candidate.metrics["roc_auc"] = 0.65
+    candidate.features = ["recent_click_count_7d"]  # feature는 달라도 된다
+
+    compared = oe.apply_baseline_comparison(candidate, baseline)
+
+    assert compared.baseline.experiment_name == "candidate"
+    assert compared.metrics_delta["roc_auc"] == pytest.approx(-0.05)
+
+
+def test_apply_baseline_comparison_fails_on_seed_mismatch() -> None:
+    baseline = _make_result(seed=42)
+    candidate = _make_result(seed=7)
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.apply_baseline_comparison(candidate, baseline)
+    assert excinfo.value.reason_code == "comparison_error"
+
+
+def test_apply_baseline_comparison_fails_on_model_params_mismatch() -> None:
+    baseline = _make_result()
+    candidate = _make_result(model_params={"n_estimators": 500.0, "learning_rate": 0.05, "num_leaves": 31.0, "scale_pos_weight": 1.0})
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.apply_baseline_comparison(candidate, baseline)
+    assert excinfo.value.reason_code == "comparison_error"
+
+
+def test_apply_baseline_comparison_rejects_non_success_baseline() -> None:
+    baseline = _make_result(status="failed")
+    candidate = _make_result()
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.apply_baseline_comparison(candidate, baseline)
+    assert excinfo.value.reason_code == "comparison_error"

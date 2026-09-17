@@ -385,3 +385,53 @@ def run_experiment(config: ExperimentConfig, *, project_root: Path) -> Experimen
         metrics=metrics,
         comparison_conditions=comparison_conditions,
     )
+
+
+_COMPARISON_FIELDS = (
+    "data_path",
+    "row_count",
+    "seed",
+    "test_size",
+    "val_size",
+    "sampling_rate",
+    "model_type",
+    "model_params",
+)
+
+
+def apply_baseline_comparison(result: ExperimentResult, baseline: ExperimentResult) -> ExperimentResult:
+    """baseline과 비교 조건이 완전히 같을 때만 metrics_delta를 계산한다(fail-fast).
+
+    features는 비교 대상에서 제외한다 — ablation 실험의 목적 자체가 feature
+    목록을 다르게 하는 것이라, feature 차이는 실패 사유가 아니다.
+    """
+    if baseline.status != "success" or baseline.comparison_conditions is None:
+        raise OfflineExperimentError(
+            "baseline 결과가 성공 상태가 아니라 비교할 수 없습니다.", reason_code="comparison_error"
+        )
+    if result.status != "success" or result.comparison_conditions is None:
+        raise OfflineExperimentError(
+            "candidate 결과가 성공 상태가 아니라 비교할 수 없습니다.", reason_code="comparison_error"
+        )
+
+    baseline_conditions = baseline.comparison_conditions.model_dump()
+    candidate_conditions = result.comparison_conditions.model_dump()
+    mismatches = [
+        f"{field}: baseline={baseline_conditions[field]!r} candidate={candidate_conditions[field]!r}"
+        for field in _COMPARISON_FIELDS
+        if baseline_conditions[field] != candidate_conditions[field]
+    ]
+    if mismatches:
+        raise OfflineExperimentError(
+            "baseline과 candidate의 비교 조건이 다릅니다 — feature 목록 외 조건은 "
+            "동일해야 공정한 비교입니다:\n" + "\n".join(mismatches),
+            reason_code="comparison_error",
+        )
+
+    delta = {name: result.metrics[name] - baseline.metrics[name] for name in result.metrics}
+    return result.model_copy(
+        update={
+            "baseline": BaselineSummary(experiment_name=baseline.experiment_name, metrics=baseline.metrics),
+            "metrics_delta": delta,
+        }
+    )
