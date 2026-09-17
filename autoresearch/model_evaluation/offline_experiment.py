@@ -414,6 +414,24 @@ def apply_baseline_comparison(result: ExperimentResult, baseline: ExperimentResu
             "candidate 결과가 성공 상태가 아니라 비교할 수 없습니다.", reason_code="comparison_error"
         )
 
+    if baseline.metrics is None:
+        raise OfflineExperimentError(
+            "baseline 결과의 metrics가 없습니다 — 성공한 결과는 metrics를 포함해야 합니다.",
+            reason_code="comparison_error",
+        )
+    if result.metrics is None:
+        raise OfflineExperimentError(
+            "candidate 결과의 metrics가 없습니다 — 성공한 결과는 metrics를 포함해야 합니다.",
+            reason_code="comparison_error",
+        )
+
+    missing_in_baseline = set(result.metrics.keys()) - set(baseline.metrics.keys())
+    if missing_in_baseline:
+        raise OfflineExperimentError(
+            f"baseline의 metrics에 있어야 할 key가 없습니다: {sorted(missing_in_baseline)}",
+            reason_code="comparison_error",
+        )
+
     baseline_conditions = baseline.comparison_conditions.model_dump()
     candidate_conditions = result.comparison_conditions.model_dump()
     mismatches = [

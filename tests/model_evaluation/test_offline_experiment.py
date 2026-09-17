@@ -317,3 +317,72 @@ def test_apply_baseline_comparison_rejects_non_success_baseline() -> None:
     with pytest.raises(oe.OfflineExperimentError) as excinfo:
         oe.apply_baseline_comparison(candidate, baseline)
     assert excinfo.value.reason_code == "comparison_error"
+
+
+def test_apply_baseline_comparison_rejects_non_success_candidate() -> None:
+    baseline = _make_result()
+    candidate = _make_result(status="failed")
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.apply_baseline_comparison(candidate, baseline)
+    assert excinfo.value.reason_code == "comparison_error"
+
+
+def test_apply_baseline_comparison_rejects_baseline_with_missing_metrics() -> None:
+    baseline = oe.ExperimentResult(
+        experiment_name="baseline",
+        status="success",
+        model="lightgbm",
+        features=["age_group"],
+        metrics=None,  # metrics is None despite status="success"
+        comparison_conditions=oe.ComparisonConditions(
+            data_path="data/processed/training_dataset.csv",
+            row_count=100,
+            seed=42,
+            test_size=0.2,
+            val_size=0.2,
+            sampling_rate=1.0,
+            model_type="lightgbm",
+            model_params={"n_estimators": 200.0, "learning_rate": 0.05, "num_leaves": 31.0, "scale_pos_weight": 1.0},
+        ),
+    )
+    candidate = _make_result()
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.apply_baseline_comparison(candidate, baseline)
+    assert excinfo.value.reason_code == "comparison_error"
+
+
+def test_apply_baseline_comparison_rejects_candidate_with_missing_metrics() -> None:
+    baseline = _make_result()
+    candidate = oe.ExperimentResult(
+        experiment_name="candidate",
+        status="success",
+        model="lightgbm",
+        features=["age_group"],
+        metrics=None,  # metrics is None despite status="success"
+        comparison_conditions=oe.ComparisonConditions(
+            data_path="data/processed/training_dataset.csv",
+            row_count=100,
+            seed=42,
+            test_size=0.2,
+            val_size=0.2,
+            sampling_rate=1.0,
+            model_type="lightgbm",
+            model_params={"n_estimators": 200.0, "learning_rate": 0.05, "num_leaves": 31.0, "scale_pos_weight": 1.0},
+        ),
+    )
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.apply_baseline_comparison(candidate, baseline)
+    assert excinfo.value.reason_code == "comparison_error"
+
+
+def test_apply_baseline_comparison_rejects_baseline_missing_metric_key() -> None:
+    baseline = _make_result()
+    baseline.metrics = {"roc_auc": 0.7, "pr_auc": 0.1}  # missing log_loss
+    candidate = _make_result()
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.apply_baseline_comparison(candidate, baseline)
+    assert excinfo.value.reason_code == "comparison_error"
