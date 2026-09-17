@@ -4,7 +4,8 @@
 [파이프라인] 피처 조립 → 학습 → 평가 → comparison → champion 승격 구간의
 진입점(배선)을 담당한다: `python -m autoresearch.cli create-experiment-plan /
 build-features / train-model / evaluate-model / run-pipeline / verify-comparison /
-compare-paired-experiment / promote-model / sweep-seeds / measure-degradation`.
+compare-paired-experiment / promote-model / sweep-seeds / measure-degradation /
+run-experiment`.
 
 [기능] 각 단계 모듈에 인자를 전달하고 단계 순서를 정한다. #466의
 create-experiment-plan은 write-once GCS plan receipt를 만들고, 학습·comparison
@@ -21,6 +22,8 @@ negative downsampling 난수를 분리하며, `run-pipeline`은 검증된 snapsh
 `comparison_passed`/`comparison_rejected`/`comparison_failed` 결과 payload를 남긴다(#454).
 `measure-degradation`은 단일 cutoff로 학습한 모델을 이후 날짜에 하루씩 순차 적용해
 ROC-AUC 열화 곡선과 열화 지점을 낸다(#471) — 승격 판정이 아니라 측정 도구다.
+`run-experiment`는 Feast/MLflow/ONNX/승격 경로와 완전히 분리된, 로컬 CSV 기반
+오프라인 feature/model 실험 전용 명령이다(`autoresearch/model_evaluation/offline_experiment.py`).
 
 [비책임] 실제 조립·학습·평가·승격 로직은 각 모듈(`autoresearch/model_training/`,
 `autoresearch/model_evaluation/`, `autoresearch/model_registry/promote.py`)이 소유한다. DAG·스케줄·재시도는 인접 저장소
@@ -51,6 +54,7 @@ from autoresearch.model_training import (  # noqa: E402
 from autoresearch.model_evaluation import (  # noqa: E402
     degradation_eval,
     evaluate,
+    offline_experiment,
     paired_experiment,
     training_comparison,
 )
@@ -841,6 +845,59 @@ def compare_paired_experiment(
     typer.echo(result.model_dump_json())
     if result.outcome == paired_experiment.OUTCOME_FAILED:
         raise typer.Exit(code=1)
+
+
+@app.command("run-experiment")
+def run_experiment_command(
+    config: Path = typer.Option(..., "--config", help="ExperimentConfig YAML 경로"),
+    output: Path = typer.Option(..., "--output", help="ExperimentResult JSON을 저장할 경로"),
+    baseline_result: Optional[Path] = typer.Option(
+        None,
+        "--baseline-result",
+        help="비교할 baseline ExperimentResult JSON 경로. 주면 비교 조건이 전부 "
+        "일치할 때만 metrics_delta를 계산한다(#offline-experiment).",
+    ),
+) -> None:
+    """로컬 CSV로 feature 부분집합·모델 실험을 실행하고 결과를 JSON으로 남긴다.
+
+    Feast/MLflow/ONNX/promotion 경로와 완전히 분리된 오프라인 실험 전용 명령이다
+    (`autoresearch/model_evaluation/offline_experiment.py`). 이 경로의 산출물은 champion 승격과
+    무관하다.
+
+    exit code: 성공 0, config·baseline 비교조건 검증 실패 2, 그 외 예기치 못한
+    실행 실패 1. 실패해도 `status: "failed"` 결과 JSON은 항상 `--output`에 남는다.
+    """
+    experiment_name = "unknown"
+    try:
+        parsed_config = offline_experiment.load_experiment_config(config)
+        experiment_name = parsed_config.experiment.name
+        baseline = (
+            offline_experiment.load_experiment_result(baseline_result)
+            if baseline_result is not None
+            else None
+        )
+        result = offline_experiment.run_experiment(parsed_config, project_root=Path(PROJECT_ROOT))
+        if baseline is not None:
+            result = offline_experiment.apply_baseline_comparison(result, baseline)
+    except offline_experiment.OfflineExperimentError as error:
+        failed_result = offline_experiment.ExperimentResult(
+            experiment_name=experiment_name, status="failed", error=str(error)
+        )
+        offline_experiment.write_result(failed_result, output)
+        typer.echo(f"[실험 실패] {error}", err=True)
+        raise typer.Exit(code=2) from error
+    except Exception as error:
+        failed_result = offline_experiment.ExperimentResult(
+            experiment_name=experiment_name,
+            status="failed",
+            error=f"{type(error).__name__}: 실행 중 예기치 못한 오류가 발생했습니다.",
+        )
+        offline_experiment.write_result(failed_result, output)
+        typer.echo(f"[실험 실패] {type(error).__name__}: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+    offline_experiment.write_result(result, output)
+    typer.echo(result.model_dump_json())
 
 
 def _experiment_client_module():

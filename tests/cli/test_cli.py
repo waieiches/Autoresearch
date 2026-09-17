@@ -2113,3 +2113,136 @@ def test_report_result_rejects_non_uuid_experiment_id(tmp_path, monkeypatch) -> 
     assert outcome.exit_code == 2
     assert stub.calls == []
     assert "UUID 형식이 아닙니다" in unstyle(outcome.output)
+
+
+import yaml
+
+
+def _write_offline_experiment_dataset(tmp_path):
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(3)
+    n = 300
+    dataset = pd.DataFrame(
+        {
+            "age_group": rng.choice(["10s", "20s", "30s"], size=n),
+            "recent_click_count_7d": rng.integers(0, 20, size=n),
+            "view_count": rng.integers(0, 100000, size=n),
+            "clicked": (rng.random(n) < 0.15).astype(int),
+        }
+    )
+    dataset_path = tmp_path / "training_dataset.csv"
+    dataset.to_csv(dataset_path, index=False)
+    return dataset_path
+
+
+def _write_offline_experiment_config(tmp_path, dataset_path, *, name="baseline", features=None, seed=42):
+    payload = {
+        "experiment": {"name": name, "seed": seed},
+        "model": {"type": "lightgbm", "params": {}},
+        "data": {"path": str(dataset_path)},
+        "features": features or ["age_group", "recent_click_count_7d", "view_count"],
+        "evaluation": {"primary_metric": "roc_auc"},
+    }
+    config_path = tmp_path / f"{name}.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    return config_path
+
+
+def test_run_experiment_succeeds_and_writes_result(tmp_path) -> None:
+    dataset_path = _write_offline_experiment_dataset(tmp_path)
+    config_path = _write_offline_experiment_config(tmp_path, dataset_path)
+    output = tmp_path / "result.json"
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["run-experiment", "--config", str(config_path), "--output", str(output)],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "success"
+    assert payload["experiment_name"] == "baseline"
+
+
+def test_run_experiment_with_baseline_computes_delta(tmp_path) -> None:
+    dataset_path = _write_offline_experiment_dataset(tmp_path)
+    baseline_config = _write_offline_experiment_config(tmp_path, dataset_path, name="baseline")
+    baseline_output = tmp_path / "baseline_result.json"
+    CliRunner().invoke(
+        cli.app, ["run-experiment", "--config", str(baseline_config), "--output", str(baseline_output)]
+    )
+
+    candidate_config = _write_offline_experiment_config(
+        tmp_path, dataset_path, name="candidate", features=["recent_click_count_7d", "view_count"]
+    )
+    candidate_output = tmp_path / "candidate_result.json"
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run-experiment",
+            "--config",
+            str(candidate_config),
+            "--baseline-result",
+            str(baseline_output),
+            "--output",
+            str(candidate_output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(candidate_output.read_text(encoding="utf-8"))
+    assert payload["baseline"]["experiment_name"] == "baseline"
+    assert "roc_auc" in payload["metrics_delta"]
+
+
+def test_run_experiment_invalid_config_exits_two_without_output(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"experiment": {"name": "x"}}), encoding="utf-8")
+    output = tmp_path / "result.json"
+
+    result = CliRunner().invoke(
+        cli.app, ["run-experiment", "--config", str(config_path), "--output", str(output)]
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+
+
+def test_run_experiment_mismatched_baseline_exits_two(tmp_path) -> None:
+    dataset_path = _write_offline_experiment_dataset(tmp_path)
+    baseline_config = _write_offline_experiment_config(tmp_path, dataset_path, name="baseline", seed=42)
+    baseline_output = tmp_path / "baseline_result.json"
+    CliRunner().invoke(
+        cli.app, ["run-experiment", "--config", str(baseline_config), "--output", str(baseline_output)]
+    )
+
+    candidate_config = _write_offline_experiment_config(tmp_path, dataset_path, name="candidate", seed=7)
+    candidate_output = tmp_path / "candidate_result.json"
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run-experiment",
+            "--config",
+            str(candidate_config),
+            "--baseline-result",
+            str(baseline_output),
+            "--output",
+            str(candidate_output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(candidate_output.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert "seed" in payload["error"]
+
+
+def test_run_experiment_help_exposes_options() -> None:
+    result = CliRunner().invoke(cli.app, ["run-experiment", "--help"], color=False)
+    help_output = unstyle(result.output)
+    assert "--config" in help_output
+    assert "--output" in help_output
+    assert "--baseline-result" in help_output
