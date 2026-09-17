@@ -21,13 +21,26 @@ Model Registry 등록, Feast 조회는 다루지 않는다 — 이 경로는 Fea
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Sequence
 
+import numpy as np
+import pandas as pd
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
+from sklearn.model_selection import train_test_split
 
+from autoresearch.feature_engineering.model_contract import CATEGORICAL_FEATURE_COLUMNS
+from autoresearch.model_training.downsampling import apply_downsampling_calibration, downsample_negatives
 from autoresearch.model_training.model_factory import MODEL_REGISTRY
+from autoresearch.model_training.train import (
+    collect_categorical_categories,
+    compute_auto_scale_pos_weight,
+    load_config,
+    require_binary_labels,
+)
 from autoresearch.model_training.training_provenance import write_manifest_atomic
 
 LABEL_COLUMN = "clicked"
@@ -173,3 +186,202 @@ def load_experiment_result(path: str | Path) -> ExperimentResult:
 def write_result(result: ExperimentResult, path: str | Path) -> None:
     """ExperimentResult를 원자적으로 JSON 파일에 게시한다(기존 아티팩트 저장 관례 재사용)."""
     write_manifest_atomic(result, Path(path))
+
+
+def _resolve_split_sizes(data: DataSection, prod_data_defaults: dict) -> tuple[float, float]:
+    """config에 없으면 prod config.yaml의 data.test_size/val_size를 그대로 쓴다."""
+    test_size = data.test_size if data.test_size is not None else float(prod_data_defaults["test_size"])
+    val_size = data.val_size if data.val_size is not None else float(prod_data_defaults["val_size"])
+    if test_size + val_size >= 1:
+        raise OfflineExperimentError(
+            f"test_size({test_size}) + val_size({val_size}) >= 1 입니다 — "
+            "train에 데이터가 남지 않습니다.",
+            reason_code="config_error",
+        )
+    return test_size, val_size
+
+
+def _split_dataset(
+    dataset: pd.DataFrame, *, test_size: float, val_size: float, seed: int
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """train.py Step 2와 동일한 2단계 stratified split(같은 seed, stratify=clicked)."""
+    if test_size + val_size >= 1:
+        raise OfflineExperimentError(
+            f"test_size({test_size}) + val_size({val_size}) >= 1 입니다.",
+            reason_code="config_error",
+        )
+    source_positions = np.arange(len(dataset))
+    train_val_positions, test_positions = train_test_split(
+        source_positions,
+        test_size=test_size,
+        random_state=seed,
+        stratify=dataset[LABEL_COLUMN],
+    )
+    val_ratio_within_train_val = val_size / (1 - test_size)
+    train_positions, val_positions = train_test_split(
+        train_val_positions,
+        test_size=val_ratio_within_train_val,
+        random_state=seed,
+        stratify=dataset.iloc[train_val_positions][LABEL_COLUMN],
+    )
+    train_df = dataset.iloc[train_positions].copy()
+    val_df = dataset.iloc[val_positions].copy()
+    test_df = dataset.iloc[test_positions].copy()
+    for stage, split_df in (("train", train_df), ("val", val_df), ("test", test_df)):
+        require_binary_labels(split_df[LABEL_COLUMN], stage=stage)
+    return train_df, val_df, test_df
+
+
+def _resolve_scale_pos_weight(
+    configured_spw: object, *, nominal_sampling_rate: float, y_train: pd.Series
+) -> float:
+    """train.py Step 5와 동일한 규칙(downsampling 활성 시 강제 1, 'auto', 고정값)."""
+    if nominal_sampling_rate < 1.0:
+        explicit_numeric = configured_spw != "auto" and float(configured_spw) != 1
+        if explicit_numeric:
+            raise OfflineExperimentError(
+                f"downsampling(sampling_rate={nominal_sampling_rate})과 명시적 "
+                f"scale_pos_weight={configured_spw}를 함께 설정했습니다 — 이중 보정입니다.",
+                reason_code="config_error",
+            )
+        return 1.0
+    if configured_spw == "auto":
+        return float(compute_auto_scale_pos_weight(y_train))
+    return float(configured_spw)
+
+
+def _evaluate_held_out(
+    model: object,
+    dataset: pd.DataFrame,
+    feature_columns: Sequence[str],
+    categorical_columns: Sequence[str],
+    *,
+    sampling_rate: float,
+) -> dict[str, float]:
+    """evaluate.py의 held-out 지표 계산과 동일한 로직(raw roc/pr, calibrated log_loss).
+
+    `evaluate_held_out_metrics`를 그대로 재사용하지 않는다 — 그 함수는 prod 고정
+    `CATEGORICAL_FEATURE_COLUMNS` 5개 전부를 캐스팅하려 시도해, ablation으로
+    categorical feature 하나가 feature_columns에서 빠지면 KeyError로 죽는다.
+    """
+    features = dataset[list(feature_columns)].copy()
+    for column in categorical_columns:
+        features[column] = features[column].astype("category")
+    labels = dataset[LABEL_COLUMN]
+    raw_proba = model.predict_proba(features)[:, 1]
+    calibrated_proba = apply_downsampling_calibration(raw_proba, sampling_rate)
+    return {
+        "roc_auc": float(roc_auc_score(labels, raw_proba)),
+        "pr_auc": float(average_precision_score(labels, raw_proba)),
+        "log_loss": float(log_loss(labels, calibrated_proba)),
+    }
+
+
+def _effective_model_params(config: ExperimentConfig, prod_model_defaults: dict) -> dict:
+    """prod config.yaml의 model: 섹션 기본값에 ExperimentConfig.model.params를 덮어쓴다."""
+    merged = {
+        "n_estimators": prod_model_defaults["n_estimators"],
+        "learning_rate": prod_model_defaults["learning_rate"],
+        "num_leaves": prod_model_defaults["num_leaves"],
+        "scale_pos_weight": prod_model_defaults["scale_pos_weight"],
+        "sampling_rate": prod_model_defaults["sampling_rate"],
+    }
+    merged.update(config.model.params)
+    return merged
+
+
+def run_experiment(config: ExperimentConfig, *, project_root: Path) -> ExperimentResult:
+    """ExperimentConfig 하나를 실행해 ExperimentResult(성공)를 만든다.
+
+    실패는 예외(`OfflineExperimentError` 또는 예기치 못한 표준 예외)로 전파한다 —
+    이 함수는 실패 결과를 만들지 않는다. 실패 시 `status: "failed"` 결과를 만드는
+    책임은 CLI 계층(`autoresearch/cli.py`)에 있다.
+    """
+    prod_config = load_config(str(project_root / "autoresearch" / "model_training" / "config.yaml"))
+
+    data_path = config.data.path
+    resolved_data_path = data_path if Path(data_path).is_absolute() else str(project_root / data_path)
+    try:
+        dataset = pd.read_csv(resolved_data_path)
+    except OSError as error:
+        raise OfflineExperimentError(
+            f"데이터셋을 읽을 수 없습니다: {resolved_data_path}", reason_code="config_error"
+        ) from error
+
+    missing = [name for name in config.features if name not in dataset.columns]
+    if missing:
+        raise OfflineExperimentError(
+            f"features에 데이터셋에 없는 컬럼이 있습니다: {missing}. "
+            f"데이터셋 컬럼: {sorted(dataset.columns)}",
+            reason_code="config_error",
+        )
+
+    feature_columns = list(config.features)
+    categorical_columns = [c for c in CATEGORICAL_FEATURE_COLUMNS if c in feature_columns]
+
+    test_size, val_size = _resolve_split_sizes(config.data, prod_config["data"])
+    seed = config.experiment.seed
+    train_df, val_df, test_df = _split_dataset(dataset, test_size=test_size, val_size=val_size, seed=seed)
+
+    X_train = train_df[feature_columns].copy()
+    y_train = train_df[LABEL_COLUMN].copy()
+    X_val = val_df[feature_columns].copy()
+
+    model_params = _effective_model_params(config, prod_config["model"])
+    nominal_sampling_rate = float(model_params["sampling_rate"])
+    if not math.isfinite(nominal_sampling_rate) or not (0.0 < nominal_sampling_rate <= 1.0):
+        raise OfflineExperimentError(
+            f"sampling_rate는 (0, 1] 범위여야 합니다: {nominal_sampling_rate}",
+            reason_code="config_error",
+        )
+
+    realized_sampling_rate = 1.0
+    if nominal_sampling_rate < 1.0:
+        X_train, y_train, realized_sampling_rate = downsample_negatives(
+            X_train, y_train, nominal_sampling_rate, random_state=seed
+        )
+
+    scale_pos_weight = _resolve_scale_pos_weight(
+        model_params["scale_pos_weight"], nominal_sampling_rate=nominal_sampling_rate, y_train=y_train
+    )
+
+    collect_categorical_categories(X_train, X_val, categorical_columns)
+
+    model_cls = MODEL_REGISTRY[config.model.type]
+    model = model_cls(
+        scale_pos_weight=scale_pos_weight,
+        n_estimators=int(model_params["n_estimators"]),
+        learning_rate=float(model_params["learning_rate"]),
+        num_leaves=int(model_params["num_leaves"]),
+        random_state=seed,
+    )
+    model.fit(X_train, y_train, categorical_features=categorical_columns)
+
+    metrics = _evaluate_held_out(
+        model, test_df, feature_columns, categorical_columns, sampling_rate=realized_sampling_rate
+    )
+
+    comparison_conditions = ComparisonConditions(
+        data_path=config.data.path,
+        row_count=len(dataset),
+        seed=seed,
+        test_size=test_size,
+        val_size=val_size,
+        sampling_rate=nominal_sampling_rate,
+        model_type=config.model.type,
+        model_params={
+            "n_estimators": float(model_params["n_estimators"]),
+            "learning_rate": float(model_params["learning_rate"]),
+            "num_leaves": float(model_params["num_leaves"]),
+            "scale_pos_weight": float(scale_pos_weight),
+        },
+    )
+
+    return ExperimentResult(
+        experiment_name=config.experiment.name,
+        status="success",
+        model=config.model.type,
+        features=feature_columns,
+        metrics=metrics,
+        comparison_conditions=comparison_conditions,
+    )
