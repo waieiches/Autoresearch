@@ -49,6 +49,8 @@
 - [가이드 — 학습 데이터셋](guides/training-dataset.md)
 - [가이드 — CTR 모델 명세](guides/ctr-model-specification.md)
 - [가이드 — 학습 실험 provenance 애플리케이션 설계](guides/training-experiment-provenance.md)
+- [Spec — Auto Research용 오프라인 실험 경로](specs/2026-09-14-auto-research-offline-experiment-path.md) —
+  feature 부분집합 선택·baseline diff를 Feast/MLflow 없이 로컬 CLI로 반복하는 경로 계약
 - [Spec — 모델 승격 구조화 결과 계약](specs/2026-07-29-model-promotion-structured-outcome.md)
 - [Spec — CTR 모델 배포 패키지](archive/specs/2026-08-01-ctr-model-deployment-package.md) (구현 완료·아카이브)
 - [Plan — CTR 모델 배포 패키지 구현](archive/plans/2026-08-01-ctr-model-deployment-package.md) (구현 완료·아카이브)
@@ -142,6 +144,8 @@
   승격·게이트 미달·후보 없음·실행 오류의 기계 판독 결과와 Airflow 인계 계약
 - [paired offline 실험 배치·비교 결과 계약](specs/2026-08-03-paired-offline-experiment-comparison.md) —
   baseline/candidate 조건 격리, 실험 피처 보존, `comparison_passed`/`rejected`/`failed` 결과 payload
+- [Auto Research용 오프라인 실험 경로](specs/2026-09-14-auto-research-offline-experiment-path.md) —
+  feature 부분집합 선택·baseline diff를 Feast/MLflow 없이 로컬 CLI로 반복하는 경로 계약
 - [모델 성능 열화 시점 측정(rolling-origin 평가)](specs/2026-08-03-model-degradation-rolling-origin-evaluation.md) —
   단일 cutoff 학습 → 하루 단위 순차 평가로 ROC-AUC 열화 곡선·열화 지점 산출, 데이터 가용성 제약(`A-D`)
 - [학습 데이터셋 스냅샷 GCS 게시·재사용 계약](specs/2026-08-04-training-dataset-snapshot-store.md) —

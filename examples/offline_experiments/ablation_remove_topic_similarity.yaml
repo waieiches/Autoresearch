@@ -1,0 +1,35 @@
+experiment:
+  name: ablation_remove_topic_similarity
+  seed: 42
+
+model:
+  type: lightgbm
+  params: {}
+
+data:
+  path: data/processed/training_dataset.csv
+
+features:
+  - age_group
+  - occupation
+  - watch_time_band
+  - recent_click_count_7d
+  - recent_view_count_7d
+  - recent_watch_time_7d
+  - recent_like_count_7d
+  - historical_category_affinity
+  - total_event_count_7d
+  - category_id
+  - duration_sec
+  - view_count
+  - like_ratio
+  - comment_ratio
+  - days_since_upload
+  - channel_subscriber_count
+  - channel_view_count
+  - channel_video_count
+  - preferred_category_match
+  - historical_category_match
+
+evaluation:
+  primary_metric: roc_auc
