@@ -82,6 +82,42 @@ def test_load_experiment_config_rejects_unknown_model_type(tmp_path) -> None:
         oe.load_experiment_config(config_path)
 
 
+def test_load_experiment_config_rejects_unknown_model_params_key(tmp_path) -> None:
+    """오타(learnign_rate)가 조용히 무시되지 않고 config_error로 드러나야 한다."""
+    payload = _valid_config_dict()
+    payload["model"]["params"] = {"learnign_rate": 0.1}
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.load_experiment_config(config_path)
+    assert excinfo.value.reason_code == "config_error"
+
+
+@pytest.mark.parametrize("bad_test_size", [0, -0.1, 1.5])
+def test_load_experiment_config_rejects_out_of_range_test_size(tmp_path, bad_test_size) -> None:
+    payload = _valid_config_dict()
+    payload["data"]["test_size"] = bad_test_size
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.load_experiment_config(config_path)
+    assert excinfo.value.reason_code == "config_error"
+
+
+@pytest.mark.parametrize("bad_val_size", [0, -0.1, 1.5])
+def test_load_experiment_config_rejects_out_of_range_val_size(tmp_path, bad_val_size) -> None:
+    payload = _valid_config_dict()
+    payload["data"]["val_size"] = bad_val_size
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(oe.OfflineExperimentError) as excinfo:
+        oe.load_experiment_config(config_path)
+    assert excinfo.value.reason_code == "config_error"
+
+
 def test_experiment_result_roundtrip(tmp_path) -> None:
     result = oe.ExperimentResult(
         experiment_name="baseline",

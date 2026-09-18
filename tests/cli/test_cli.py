@@ -2195,7 +2195,7 @@ def test_run_experiment_with_baseline_computes_delta(tmp_path) -> None:
     assert "roc_auc" in payload["metrics_delta"]
 
 
-def test_run_experiment_invalid_config_exits_two_without_output(tmp_path) -> None:
+def test_run_experiment_invalid_config_exits_two_and_writes_failed_result(tmp_path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"experiment": {"name": "x"}}), encoding="utf-8")
     output = tmp_path / "result.json"

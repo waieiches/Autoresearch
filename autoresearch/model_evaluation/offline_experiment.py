@@ -12,10 +12,17 @@ held-out 평가 → baseline 대비 diff 구간을 담당한다. `build-features
 (JSON)를 만든다. `apply_baseline_comparison()`은 두 결과의 비교 조건이
 일치하는지 확인한 뒤에만 metric delta를 계산한다(fail-fast).
 
-[비책임] MLflow run 로깅, ONNX 변환, promotion evidence, snapshot manifest,
-Model Registry 등록, Feast 조회는 다루지 않는다 — 이 경로는 Feast 없이
-이미 존재하는 로컬 CSV만 입력으로 받는다. prod `MODEL_FEATURE_COLUMNS`/ONNX
-입력 순서 계약은 건드리지 않는다(`autoresearch/feature_engineering/model_contract.py` 무수정).
+[비책임] 이 경로는 MLflow run을 시작하지 않고, ONNX로 변환하지 않고, Model
+Registry에 등록하지 않고, Feast를 조회하지 않는다 — Feast 없이 이미 존재하는
+로컬 CSV만 입력으로 받는다. prod `MODEL_FEATURE_COLUMNS`/ONNX 입력 순서 계약은
+건드리지 않는다(`autoresearch/feature_engineering/model_contract.py` 무수정).
+`autoresearch.model_training.train`(MLflow/ONNX/GCS snapshot/promotion evidence를
+top-level에서 import하는 모듈)에서 재사용하는 `require_binary_labels`/
+`compute_auto_scale_pos_weight`/`collect_categorical_categories`와
+`training_provenance.write_manifest_atomic`은 각 사용 함수 내부에서 지연
+import한다 — 이 모듈을 import하는 시점에는 MLflow/ONNX/GCS를 끌어오지 않는다
+(실측: `import autoresearch.model_evaluation.offline_experiment` 후
+`sys.modules`에 `mlflow`/`mlflow.onnx`가 없음을 확인).
 """
 
 from __future__ import annotations
@@ -35,22 +42,18 @@ from sklearn.model_selection import train_test_split
 from autoresearch.feature_engineering.model_contract import CATEGORICAL_FEATURE_COLUMNS
 from autoresearch.model_training.downsampling import apply_downsampling_calibration, downsample_negatives
 from autoresearch.model_training.model_factory import MODEL_REGISTRY
-from autoresearch.model_training.train import (
-    collect_categorical_categories,
-    compute_auto_scale_pos_weight,
-    load_config,
-    require_binary_labels,
-)
-from autoresearch.model_training.training_provenance import write_manifest_atomic
 
 LABEL_COLUMN = "clicked"
 _KNOWN_METRICS = ("roc_auc", "pr_auc", "log_loss")
+_KNOWN_MODEL_PARAMS = frozenset(
+    {"n_estimators", "learning_rate", "num_leaves", "scale_pos_weight", "sampling_rate"}
+)
 
 
 class OfflineExperimentError(Exception):
     """offline_experiment의 설정·비교조건 검증 실패. exit code를 가르는 데 쓴다."""
 
-    def __init__(self, message: str, *, reason_code: Literal["config_error", "comparison_error"]):
+    def __init__(self, message: str, *, reason_code: Literal["config_error", "comparison_error"]) -> None:
         super().__init__(message)
         self.reason_code = reason_code
 
@@ -77,11 +80,22 @@ class ModelSection(_StrictModel):
             )
         return value
 
+    @field_validator("params")
+    @classmethod
+    def _known_params(cls, value: dict) -> dict:
+        unknown = sorted(set(value) - _KNOWN_MODEL_PARAMS)
+        if unknown:
+            raise ValueError(
+                f"지원하지 않는 model.params key: {unknown} (지원: {sorted(_KNOWN_MODEL_PARAMS)}) — "
+                "오타는 조용히 무시되지 않고 config_error로 처리합니다."
+            )
+        return value
+
 
 class DataSection(_StrictModel):
     path: str
-    test_size: Optional[float] = None
-    val_size: Optional[float] = None
+    test_size: Optional[float] = Field(default=None, gt=0.0, lt=1.0)
+    val_size: Optional[float] = Field(default=None, gt=0.0, lt=1.0)
 
 
 class EvaluationSection(_StrictModel):
@@ -185,7 +199,19 @@ def load_experiment_result(path: str | Path) -> ExperimentResult:
 
 def write_result(result: ExperimentResult, path: str | Path) -> None:
     """ExperimentResult를 원자적으로 JSON 파일에 게시한다(기존 아티팩트 저장 관례 재사용)."""
+    from autoresearch.model_training.training_provenance import write_manifest_atomic
+
     write_manifest_atomic(result, Path(path))
+
+
+def _load_prod_config(path: Path) -> dict:
+    """prod config.yaml을 UTF-8로 읽는다.
+
+    `autoresearch.model_training.train.load_config`는 encoding을 지정하지 않아
+    Windows 기본 로케일(cp949)에서 config.yaml의 한글 주석 때문에
+    UnicodeDecodeError가 난다. train.py는 무수정 대상이라 여기서 직접 읽는다.
+    """
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def _resolve_split_sizes(data: DataSection, prod_data_defaults: dict) -> tuple[float, float]:
@@ -205,6 +231,8 @@ def _split_dataset(
     dataset: pd.DataFrame, *, test_size: float, val_size: float, seed: int
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """train.py Step 2와 동일한 2단계 stratified split(같은 seed, stratify=clicked)."""
+    from autoresearch.model_training.train import require_binary_labels
+
     if test_size + val_size >= 1:
         raise OfflineExperimentError(
             f"test_size({test_size}) + val_size({val_size}) >= 1 입니다.",
@@ -236,6 +264,8 @@ def _resolve_scale_pos_weight(
     configured_spw: object, *, nominal_sampling_rate: float, y_train: pd.Series
 ) -> float:
     """train.py Step 5와 동일한 규칙(downsampling 활성 시 강제 1, 'auto', 고정값)."""
+    from autoresearch.model_training.train import compute_auto_scale_pos_weight
+
     if nominal_sampling_rate < 1.0:
         explicit_numeric = configured_spw != "auto" and float(configured_spw) != 1
         if explicit_numeric:
@@ -297,7 +327,9 @@ def run_experiment(config: ExperimentConfig, *, project_root: Path) -> Experimen
     이 함수는 실패 결과를 만들지 않는다. 실패 시 `status: "failed"` 결과를 만드는
     책임은 CLI 계층(`autoresearch/cli.py`)에 있다.
     """
-    prod_config = load_config(str(project_root / "autoresearch" / "model_training" / "config.yaml"))
+    from autoresearch.model_training.train import collect_categorical_categories
+
+    prod_config = _load_prod_config(project_root / "autoresearch" / "model_training" / "config.yaml")
 
     data_path = config.data.path
     resolved_data_path = data_path if Path(data_path).is_absolute() else str(project_root / data_path)
